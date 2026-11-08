@@ -20,7 +20,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--model', default='kl_d512_m512_l8', type=str,
                     metavar='MODEL', help='Name of model to train')
 parser.add_argument(
-    '--pth', default='output/ae/kl_d512_m512/checkpoint-199.pth', type=str)
+    '--pth', default='output/ae/kl_d512_m512_l8/checkpoint-199.pth', type=str)
 parser.add_argument('--device', default='cuda',
                     help='device to use for training / testing')
 parser.add_argument('--seed', default=0, type=int)
@@ -44,7 +44,7 @@ def main():
     device = torch.device(args.device)
 
     model.eval()
-    model.load_state_dict(torch.load(args.pth, map_location='cpu')[
+    model.load_state_dict(torch.load(args.pth, map_location='cpu', weights_only=False)[
                           'model'], strict=True)
     model.to(device)
     # print(model)
@@ -97,7 +97,7 @@ def main():
                 pred[output[0] >= 0] = 1
                 # accuracy = (pred==labels[0]).float().sum() / labels[0].numel()
                 intersection = (pred * labels[0]).sum()
-                union = (pred + labels[0]).gt(0).sum()
+                union = (pred + labels[0]).gt(0).sum() + 1e-5
                 iou = intersection * 1.0 / union
 
                 metric_logger.update(iou=iou.item())
@@ -148,11 +148,11 @@ def main():
                         fscore = 0
                 metric_logger.update(fscore=fscore)
 
-            print(category, metric_logger.iou.avg, metric_logger.cd.avg, metric_logger.fscore.avg)
+            print(category, metric_logger.iou.global_avg, metric_logger.cd.global_avg, metric_logger.fscore.global_avg)
 
         print(args)
         for (category, _), metric_logger in zip(category_ids.items(), metric_loggers):
-            print(category, metric_logger.iou.avg, metric_logger.cd.avg, metric_logger.fscore.avg)
+            print(category, metric_logger.iou.global_avg, metric_logger.cd.global_avg, metric_logger.fscore.global_avg)
 
 
 if __name__ == '__main__':

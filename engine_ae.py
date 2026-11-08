@@ -163,8 +163,8 @@ def evaluate(data_loader, model, device):
         accuracy = (pred==labels).float().sum(dim=1) / labels.shape[1]
         accuracy = accuracy.mean()
         intersection = (pred * labels).sum(dim=1)
-        union = (pred + labels).gt(0).sum(dim=1)
-        iou = intersection * 1.0 / union + 1e-5
+        union = (pred + labels).gt(0).sum(dim=1) + 1e-5
+        iou = intersection * 1.0 / union
         iou = iou.mean()
 
         batch_size = points.shape[0]

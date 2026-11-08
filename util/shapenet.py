@@ -104,8 +104,8 @@ class ShapeNet(data.Dataset):
 
             split_file = os.path.join(subpath, split + '.lst')
             with open(split_file, 'r') as f:
-                models_c = f.read().split('\n')
-            
+                models_c = [m.strip() for m in f.read().splitlines() if m.strip()]
+
             self.models += [
                 {'category': c, 'model': m.replace('.npz', '')}
                 for m in models_c
@@ -127,8 +127,7 @@ class ShapeNet(data.Dataset):
                 near_points = data['near_points']
                 near_label = data['near_label']
         except Exception as e:
-            print(e)
-            print(point_path)
+            raise RuntimeError('Failed to load {}'.format(point_path)) from e
 
         with open(point_path.replace('.npz', '.npy'), 'rb') as f:
             scale = np.load(f).item()

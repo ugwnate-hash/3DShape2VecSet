@@ -42,8 +42,8 @@ def get_args_parser():
     # Optimizer parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
                         help='Clip gradient norm (default: None, no clipping)')
-    parser.add_argument('--weight_decay', type=float, default=0.05,
-                        help='weight decay (default: 0.05)')
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                        help='weight decay (default: 0.01)')
 
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
@@ -157,10 +157,10 @@ def main(args):
         drop_last=False
     )
 
-    ae = models_ae.__dict__[args.ae]()
+    ae = models_ae.__dict__[args.ae](N=args.point_cloud_size)
     ae.eval()
     print("Loading autoencoder %s" % args.ae_pth)
-    ae.load_state_dict(torch.load(args.ae_pth, map_location='cpu')['model'])
+    ae.load_state_dict(torch.load(args.ae_pth, map_location='cpu', weights_only=False)['model'])
     
     ae.to(device)
 
@@ -193,7 +193,7 @@ def main(args):
     #     no_weight_decay_list=model_without_ddp.no_weight_decay(),
     #     layer_decay=args.layer_decay
     # )
-    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_scaler = NativeScaler()
 
     criterion = models_class_cond.__dict__['EDMLoss']()
@@ -203,15 +203,15 @@ def main(args):
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, ae, criterion, device)
         print(f"loss of the network on the {len(dataset_val)} test images: {test_stats['loss']:.3f}")
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
+        # The train sampler is always a DistributedSampler, even on a single process.
+        data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, ae, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,

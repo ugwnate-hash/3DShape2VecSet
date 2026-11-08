@@ -28,10 +28,14 @@ torchrun \
     --point_cloud_size 2048 \
     --batch_size 64 \
     --epochs 200 \
-    --warmup_epochs 5
+    --warmup_epochs 5 \
+    --data_path ~/data/
 ```
 ```
-python eval.py
+python eval.py \
+    --model kl_d512_m512_l8 \
+    --pth output/ae/kl_d512_m512_l8/checkpoint-199.pth \
+    --data_path ~/data/
 ```
 
 ### Second stage (category-conditioned generation):
@@ -58,7 +62,7 @@ python sample_class_cond.py \
     --ae kl_d512_m512_l8 \
     --ae-pth output/ae/kl_d512_m512_l8/checkpoint-199.pth \
     --dm kl_d512_m512_l8_d24_edm \
-    --dm-pth output/class_cond_dm/kl_d512_m512_l8_d24_edm/checkpoint-499.pth
+    --dm-pth output/dm/kl_d512_m512_l8_d24_edm/checkpoint-999.pth
 ```
 
 Pretrained model can be found [here](https://drive.google.com/drive/folders/1tX4pFulWqtICYgchRXmzscHDRJ5q2iSz?usp=sharing).

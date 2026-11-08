@@ -39,8 +39,8 @@ def get_args_parser():
     # Optimizer parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
                         help='Clip gradient norm (default: None, no clipping)')
-    parser.add_argument('--weight_decay', type=float, default=0.05,
-                        help='weight decay (default: 0.05)')
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                        help='weight decay (default: 0.01)')
 
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
@@ -184,7 +184,7 @@ def main(args):
     #     no_weight_decay_list=model_without_ddp.no_weight_decay(),
     #     layer_decay=args.layer_decay
     # )
-    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     loss_scaler = NativeScaler()
 
     criterion = torch.nn.BCEWithLogitsLoss()
@@ -202,8 +202,8 @@ def main(args):
     start_time = time.time()
     max_iou = 0.0
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
+        # The train sampler is always a DistributedSampler, even on a single process.
+        data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
