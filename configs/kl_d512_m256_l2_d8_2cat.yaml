@@ -1,0 +1,52 @@
+# 3DShape2VecSet, first stage: reduced KL autoencoder with C_0 = 2, sized for Kaggle.
+#
+# Read by kaggle/train_ae_kaggle.ipynb, which turns `args` and `hardware` into
+# command-line flags for main_ae.py and launches it with torchrun.
+#
+# Compared with configs/kl_d512_m512_l2.yaml (the README setup with C_0 = 2), this run is
+# about 25x cheaper per epoch. Training cost per sample is about 0.21x of the full model,
+# and the two categories hold about 1/5 of the training shapes.
+#   - M = 256 latents instead of 512. Each shape becomes 256 points in 2D.
+#   - 8 decoder self-attention blocks instead of 24. The encoder that produces the
+#     latents is unchanged; in the KL model all of these blocks are in the decoder.
+#   - 2 categories instead of 55: airplane and chair.
+#   - Mixed precision (fp16). The point embedding's Fourier features stay in fp32.
+#   - 50 epochs instead of 200. Each shape is still seen 800 times (16 per epoch).
+# C_0 = 2, the KL weight, the 2048-point input, the 2048 query points per shape and
+# the effective batch size of 512 are the same as the README.
+
+model: kl_d512_m256_l2_d8   # M = 256, C_0 = 2, width 512, decoder depth 8
+
+# Passed to main_ae.py as --<name> <value>. A null value leaves the flag out.
+# true turns on a switch flag such as --amp.
+args:
+  categories: "02691156,03001627"   # airplane, chair
+  amp: true                # fp16 mixed precision with loss scaling
+  epochs: 50               # README: 200. One epoch is 16 passes over the training shapes.
+  warmup_epochs: 2         # README: 5 of 200. Same idea, shorter run.
+  point_cloud_size: 2048   # README
+  blr: 1.0e-4              # main_ae.py default. Learning rate = blr * effective batch / 256 = 2e-4.
+  min_lr: 1.0e-6           # main_ae.py default
+  weight_decay: 0.01       # main_ae.py default
+  clip_grad: null          # main_ae.py default: no clipping
+  seed: 0                  # main_ae.py default
+  save_every_epochs: 1     # end-of-epoch checkpoint every epoch (about 0.5 GB each; the notebook keeps the newest)
+  save_every_steps: 200    # plus a rolling mid-epoch checkpoint every 200 optimizer steps
+
+# Effective batch size: 2 GPUs x 64 x 4 = 512, as in the README (4 GPUs x 64 x 2).
+# The smaller model needs at most about 0.18 GB of fp32 activations per sample, so 64 fits on a 16 GB T4.
+hardware:
+  nproc_per_node: 2   # Kaggle "GPU T4 x2"
+  batch_size: 64      # per GPU
+  accum_iter: 4
+  num_workers: 2      # data-loading workers per GPU process. Kaggle has 4 CPU cores.
+
+# Used only by the notebook.
+kaggle:
+  data_root: auto           # folder that holds ShapeNetV2_point and ShapeNetV2_watertight. auto searches /kaggle/input.
+  resume: auto              # auto: newest checkpoint of this model found in /kaggle/input or /kaggle/working. none: start fresh. Or a path.
+  time_budget_hours: 11.0   # training saves a checkpoint and stops cleanly this long after launch (main_ae.py --max_hours),
+                            # leaving time before Kaggle's 12-hour session limit. If it hasn't exited 30 min later, it is killed.
+  keep_checkpoints: 1       # checkpoints left in /kaggle/working at the end
+  benchmark_steps: 20       # timed training steps on one GPU, plus a data-loading test, before launch. 0 skips both.
+  train: true               # false: stop after the benchmark and the time estimate

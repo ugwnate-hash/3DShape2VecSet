@@ -12,6 +12,9 @@ from torch_cluster import fps
 
 from timm.models.layers import DropPath
 
+# F.scaled_dot_product_attention takes `scale` from PyTorch 2.1.
+_FUSED_ATTENTION = tuple(int(x) for x in torch.__version__.split('.')[:2]) >= (2, 1)
+
 def exists(val):
     return val is not None
 
@@ -90,6 +93,13 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h = h), (q, k, v))
 
+        if not exists(mask) and _FUSED_ATTENTION:
+            # Same computation as below, in one fused kernel: it doesn't store the attention
+            # matrix (less memory) and accumulates in fp32, which keeps fp16 training stable.
+            out = F.scaled_dot_product_attention(q, k, v, scale = self.scale)
+            out = rearrange(out, '(b h) n d -> b n (h d)', h = h)
+            return self.drop_path(self.to_out(out))
+
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
         if exists(mask):
@@ -135,7 +145,13 @@ class PointEmbed(nn.Module):
     
     def forward(self, input):
         # input: B x N x 3
-        embed = self.mlp(torch.cat([self.embed(input, self.basis), input], dim=2)) # B x N x C
+        # The Fourier features use frequencies up to 2^7 * pi. In fp16 those projections lose
+        # most of their precision and sin/cos turn into noise, so they are always computed in
+        # fp32, even under mixed precision. The linear layer after them can run in fp16.
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            input = input.float()
+            features = torch.cat([self.embed(input, self.basis), input], dim=2)
+        embed = self.mlp(features) # B x N x C
         return embed
 
 
@@ -401,10 +417,10 @@ class KLAutoEncoder(nn.Module):
         # return o.squeeze(-1), kl
         return {'logits': o, 'kl': kl}
 
-def create_autoencoder(dim=512, M=512, latent_dim=64, N=2048, determinisitc=False):
+def create_autoencoder(dim=512, M=512, latent_dim=64, N=2048, determinisitc=False, depth=24):
     if determinisitc:
         model = AutoEncoder(
-            depth=24,
+            depth=depth,
             dim=dim,
             queries_dim=dim,
             output_dim = 1,
@@ -415,7 +431,7 @@ def create_autoencoder(dim=512, M=512, latent_dim=64, N=2048, determinisitc=Fals
         )
     else:
         model = KLAutoEncoder(
-            depth=24,
+            depth=depth,
             dim=dim,
             queries_dim=dim,
             output_dim = 1,
@@ -450,6 +466,12 @@ def kl_d512_m512_l2(N=2048):
 
 def kl_d512_m512_l1(N=2048):
     return create_autoencoder(dim=512, M=512, latent_dim=1, N=N, determinisitc=False)
+
+# Reduced-cost variants: fewer latents (M) and a shallower decoder (8 self-attention
+# blocks instead of 24). In the KL models all `depth` blocks sit in the decoder, so the
+# encoder that produces the latents is the same as in the full model.
+def kl_d512_m256_l2_d8(N=2048):
+    return create_autoencoder(dim=512, M=256, latent_dim=2, N=N, determinisitc=False, depth=8)
 
 ###
 def ae_d512_m512(N=2048):

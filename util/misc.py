@@ -288,11 +288,23 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
     return total_norm
 
 
-def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
+def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, next_iter=None):
+    """Save a checkpoint.
+
+    With next_iter=None this is an end-of-epoch checkpoint, `checkpoint-<epoch>.pth`.
+    With next_iter set, it is a mid-epoch checkpoint, `checkpoint-<epoch>-it<next_iter>.pth`:
+    training resumes in the same epoch at data-loader iteration next_iter. Only the newest
+    mid-epoch checkpoint is kept, and an end-of-epoch checkpoint removes all of them.
+    The file is written to a temporary name and then renamed, so a run killed while
+    saving never leaves a truncated checkpoint behind.
+    """
     output_dir = Path(args.output_dir)
     epoch_name = str(epoch)
     if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+        if next_iter is None:
+            checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+        else:
+            checkpoint_paths = [output_dir / ('checkpoint-%s-it%d.pth' % (epoch_name, next_iter))]
         for checkpoint_path in checkpoint_paths:
             to_save = {
                 'model': model_without_ddp.state_dict(),
@@ -301,8 +313,17 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
             }
+            if next_iter is not None:
+                to_save['iter'] = next_iter
 
-            save_on_master(to_save, checkpoint_path)
+            if is_main_process():
+                tmp_path = checkpoint_path.with_name(checkpoint_path.name + '.tmp')
+                torch.save(to_save, tmp_path)
+                os.replace(tmp_path, checkpoint_path)
+                # Remove mid-epoch checkpoints that this one supersedes.
+                for old in output_dir.glob('checkpoint-*-it*.pth'):
+                    if old != checkpoint_path:
+                        old.unlink()
     else:
         client_state = {'epoch': epoch}
         model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
@@ -319,10 +340,23 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
         print("Resume checkpoint %s" % args.resume)
         if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):
             optimizer.load_state_dict(checkpoint['optimizer'])
-            args.start_epoch = checkpoint['epoch'] + 1
+            if 'iter' in checkpoint:
+                # Mid-epoch checkpoint: continue the same epoch at the saved iteration.
+                args.start_epoch = checkpoint['epoch']
+                args.start_iter = checkpoint['iter']
+                saved = checkpoint.get('args')
+                world_size = get_world_size()
+                if saved is not None and (getattr(saved, 'batch_size', None), getattr(saved, 'world_size', None)) != (args.batch_size, world_size):
+                    print("WARNING: resuming mid-epoch with a different batch size or number of GPUs "
+                          "(saved: batch_size=%s, GPUs=%s; now: batch_size=%s, GPUs=%s). The rest of this epoch "
+                          "will not continue the saved data order exactly."
+                          % (getattr(saved, 'batch_size', None), getattr(saved, 'world_size', None), args.batch_size, world_size))
+            else:
+                args.start_epoch = checkpoint['epoch'] + 1
+                args.start_iter = 0
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
-            print("With optim & sched!")
+            print("With optim & sched! Continuing at epoch %d, iteration %d" % (args.start_epoch, getattr(args, 'start_iter', 0)))
 
 
 def all_reduce_mean(x):

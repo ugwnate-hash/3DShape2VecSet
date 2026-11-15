@@ -26,6 +26,8 @@ parser.add_argument('--device', default='cuda',
 parser.add_argument('--seed', default=0, type=int)
 parser.add_argument('--data_path', type=str, required=True,
                     help='dataset path')
+parser.add_argument('--categories', default=None, type=str,
+                    help='comma-separated ShapeNet synset ids to evaluate (default: all 55)')
 args = parser.parse_args()
 
 
@@ -39,6 +41,15 @@ def main():
     np.random.seed(seed)
 
     cudnn.benchmark = True
+
+    if args.categories:
+        wanted = [c.strip() for c in args.categories.split(',') if c.strip()]
+        unknown = [c for c in wanted if c not in category_ids]
+        if unknown:
+            raise ValueError('unknown category ids: %s' % unknown)
+        eval_categories = [c for c in category_ids if c in wanted]
+    else:
+        eval_categories = list(category_ids)
 
     model = models_ae.__dict__[args.model]()
     device = torch.device(args.device)
@@ -61,7 +72,7 @@ def main():
     with torch.no_grad():
 
         metric_loggers = []
-        for category, _ in list(category_ids.items()):#[18:]:
+        for category in eval_categories:
             # metric_logger = utils.MetricLogger(delimiter="  ")
             metric_logger = misc.MetricLogger(delimiter="  ")
             metric_loggers.append(metric_logger)
@@ -102,10 +113,13 @@ def main():
 
                 metric_logger.update(iou=iou.item())
 
-                # N = 50000
-
-                output = model(surface2048, grid)['logits']
-                # output = torch.cat([model(surface2048, grid[:, i*N:(i+1)*N])[0] for i in range(math.ceil(grid.shape[1]/N))], dim=1)
+                # Decode the 129^3 grid in chunks to bound GPU memory. Encode once: the KL
+                # encoder samples its latents, so re-encoding per chunk would mix different latents.
+                encoded = model.encode(surface2048)
+                latents = encoded[1] if isinstance(encoded, tuple) else encoded
+                N = 200000
+                output = torch.cat([model.decode(latents, grid[:, i*N:(i+1)*N]).squeeze(-1)
+                                    for i in range(math.ceil(grid.shape[1] / N))], dim=1)
 
                 volume = output.view(density+1, density+1, density+1).permute(1, 0, 2).cpu().numpy()
 
@@ -151,7 +165,7 @@ def main():
             print(category, metric_logger.iou.global_avg, metric_logger.cd.global_avg, metric_logger.fscore.global_avg)
 
         print(args)
-        for (category, _), metric_logger in zip(category_ids.items(), metric_loggers):
+        for category, metric_logger in zip(eval_categories, metric_loggers):
             print(category, metric_logger.iou.global_avg, metric_logger.cd.global_avg, metric_logger.fscore.global_avg)
 
 

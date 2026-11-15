@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import itertools
 import json
 import numpy as np
 import os
@@ -21,6 +22,27 @@ import models_ae
 
 from engine_ae import train_one_epoch, evaluate
 
+
+class SkippingSampler(torch.utils.data.Sampler):
+    """Wraps a sampler and skips its first `skip` indices.
+
+    Used to resume in the middle of an epoch: the wrapped DistributedSampler gives the same
+    order for the same epoch, so skipping the indices already trained on continues where
+    the saved run stopped.
+    """
+    def __init__(self, base):
+        self.base = base
+        self.skip = 0
+
+    def set_epoch(self, epoch):
+        self.base.set_epoch(epoch)
+
+    def __iter__(self):
+        return itertools.islice(iter(self.base), self.skip, None)
+
+    def __len__(self):
+        return max(0, len(self.base) - self.skip)
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Autoencoder', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int,
@@ -35,6 +57,8 @@ def get_args_parser():
 
     parser.add_argument('--point_cloud_size', default=2048, type=int,
                         help='input size')
+    parser.add_argument('--amp', action='store_true',
+                        help='mixed precision training (fp16 autocast with loss scaling)')
 
     # Optimizer parameters
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
@@ -59,6 +83,9 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data_path', default='/ibex/scratch/projects/c2168/diffusion-shapes/datasets', type=str,
                         help='dataset path')
+    parser.add_argument('--categories', default=None, type=str,
+                        help='comma-separated ShapeNet synset ids to train and validate on, '
+                             'e.g. 02691156,03001627 (airplane, chair). Default: all categories found')
 
     parser.add_argument('--output_dir', default='./output/',
                         help='path where to save, empty for no saving')
@@ -72,6 +99,17 @@ def get_args_parser():
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
+    parser.add_argument('--start_iter', default=0, type=int,
+                        help='data-loader iteration to start the first epoch at (set by --resume from a mid-epoch checkpoint)')
+
+    # Checkpointing and time limit
+    parser.add_argument('--save_every_epochs', default=10, type=int,
+                        help='save an end-of-epoch checkpoint every N epochs (the last epoch is always saved)')
+    parser.add_argument('--save_every_steps', default=0, type=int,
+                        help='also save a mid-epoch checkpoint every N optimizer steps; 0 disables. '
+                             'Only the newest mid-epoch checkpoint is kept.')
+    parser.add_argument('--max_hours', default=0, type=float,
+                        help='stop training cleanly after this many hours, saving a checkpoint first; 0 disables')
     parser.add_argument('--eval', action='store_true',
                         help='Perform evaluation only')
     parser.add_argument('--dist_eval', action='store_true', default=False,
@@ -113,9 +151,9 @@ def main(args):
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
+        sampler_train = SkippingSampler(torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
+        ))
         print("Sampler_train = %s" % str(sampler_train))
         if args.dist_eval:
             if len(dataset_val) % num_tasks != 0:
@@ -194,30 +232,67 @@ def main(args):
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, device, amp=args.amp)
         print(f"iou of the network on the {len(dataset_val)} test images: {test_stats['iou']:.3f}")
         exit(0)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_iou = 0.0
+    first_epoch = args.start_epoch
+    # Iterations in a full epoch for this process (the loader drops the last partial batch).
+    iters_per_epoch = len(sampler_train.base) // args.batch_size
+
+    def time_is_up():
+        up = args.max_hours > 0 and time.time() - start_time > args.max_hours * 3600
+        if args.distributed:
+            # Every process must stop at the same step, so use the decision of the slowest clock.
+            flag = torch.tensor([int(up)], device=device)
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+            up = bool(flag.item())
+        return up
+
+    stop = False          # time limit reached
+    stopped_mid = False   # ...and training stopped before the end of an epoch
     for epoch in range(args.start_epoch, args.epochs):
         # The train sampler is always a DistributedSampler, even on a single process.
         data_loader_train.sampler.set_epoch(epoch)
+        start_iter = args.start_iter if epoch == first_epoch else 0
+        data_loader_train.sampler.skip = start_iter * args.batch_size
+
+        def on_step(next_iter, epoch=epoch):
+            # Called after every optimizer step. Returns True to end training now.
+            nonlocal stop, stopped_mid
+            stop = time_is_up()
+            steps_done = next_iter // args.accum_iter
+            periodic = args.save_every_steps > 0 and steps_done % args.save_every_steps == 0
+            if args.output_dir and (stop or periodic) and next_iter < iters_per_epoch:
+                misc.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                    loss_scaler=loss_scaler, epoch=epoch, next_iter=next_iter)
+            stopped_mid = stop and next_iter < iters_per_epoch
+            return stopped_mid
+
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad,
             log_writer=log_writer,
-            args=args
+            args=args,
+            start_iter=start_iter,
+            step_callback=on_step if (args.save_every_steps > 0 or args.max_hours > 0) else None,
         )
-        if args.output_dir and (epoch % 10 == 0 or epoch + 1 == args.epochs):
+        if stopped_mid:
+            print(f"Time limit of {args.max_hours} h reached in epoch {epoch}: saved a mid-epoch checkpoint, stopping.")
+            break
+
+        if args.output_dir and (epoch % args.save_every_epochs == 0 or epoch + 1 == args.epochs or stop):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
 
         if epoch % 5 == 0 or epoch + 1 == args.epochs:
-            test_stats = evaluate(data_loader_val, model, device)
+            test_stats = evaluate(data_loader_val, model, device, amp=args.amp)
             print(f"iou of the network on the {len(dataset_val)} test images: {test_stats['iou']:.3f}")
             max_iou = max(max_iou, test_stats["iou"])
             print(f'Max iou: {max_iou:.2f}%')
@@ -240,6 +315,10 @@ def main(args):
                 log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
+
+        if stop:
+            print(f"Time limit of {args.max_hours} h reached at the end of epoch {epoch}: stopping.")
+            break
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

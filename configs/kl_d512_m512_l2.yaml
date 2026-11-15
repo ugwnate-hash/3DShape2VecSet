@@ -1,0 +1,51 @@
+# 3DShape2VecSet, first stage: KL autoencoder with C_0 = 2.
+#
+# Read by kaggle/train_ae_kaggle.ipynb, which turns `args` and `hardware` into
+# command-line flags for main_ae.py and launches it with torchrun.
+#
+# Only the model changes from the README's first-stage command. The schedule
+# and the effective batch size (512) are the same. Settings the README leaves
+# out keep main_ae.py's defaults and are written out here, so this file
+# describes the whole run.
+
+# C_0 = 2: each shape is encoded as 512 latent vectors with 2 channels each.
+# The README trains kl_d512_m512_l8 (C_0 = 8). Width 512, 512 latents and
+# 24 transformer layers are unchanged.
+model: kl_d512_m512_l2
+
+# Passed to main_ae.py as --<name> <value>. A null value leaves the flag out.
+args:
+  epochs: 200             # README. One epoch is 16 passes over the training set (replica=16 in util/shapenet.py).
+  warmup_epochs: 5        # README
+  point_cloud_size: 2048  # README
+  blr: 1.0e-4             # main_ae.py default. Learning rate = blr * effective batch / 256 = 2e-4.
+  min_lr: 1.0e-6          # main_ae.py default
+  weight_decay: 0.01      # main_ae.py default (see fixed_issues_by_Claude.md, issue 5)
+  clip_grad: null         # main_ae.py default: no clipping
+  seed: 0                 # main_ae.py default
+  # Checkpointing. On Kaggle one epoch takes about one session, so the README's
+  # every-10-epochs checkpoints would lose almost all work.
+  save_every_epochs: 1    # end-of-epoch checkpoint every epoch (main_ae.py default: 10)
+  save_every_steps: 50    # plus a rolling mid-epoch checkpoint every 50 optimizer steps (about 30 min on 2x T4)
+
+# How each optimizer step is split across GPUs.
+# The README used 4 GPUs x batch_size 64 x accum_iter 2 = 512 samples per step.
+# A Kaggle T4 has 16 GB, which fits about 8 samples of this model in fp32
+# (about 0.9 GB of activations each), so 2 GPUs x 8 x 32 gives the same 512.
+# If you change these, keep nproc_per_node * batch_size * accum_iter = 512.
+# Otherwise the learning rate and the number of optimizer steps change too.
+hardware:
+  nproc_per_node: 2   # Kaggle "GPU T4 x2"
+  batch_size: 8       # per GPU
+  accum_iter: 32
+  num_workers: 2      # data-loading workers per GPU process. Kaggle has 4 CPU cores.
+
+# Used only by the notebook.
+kaggle:
+  data_root: auto           # folder that holds ShapeNetV2_point and ShapeNetV2_watertight. auto searches /kaggle/input.
+  resume: auto              # auto: newest checkpoint of this model found in /kaggle/input or /kaggle/working. none: start fresh. Or a path.
+  time_budget_hours: 11.0   # training saves a checkpoint and stops cleanly this long after launch (main_ae.py --max_hours),
+                            # leaving time before Kaggle's 12-hour session limit. If it hasn't exited 30 min later, it is killed.
+  keep_checkpoints: 1       # checkpoints left in /kaggle/working at the end. Each is about 1.3 GB.
+  benchmark_steps: 20       # timed training steps on one GPU before launch, used for the time estimate. 0 skips the benchmark.
+  train: true               # false: stop after the benchmark and the time estimate

@@ -16,10 +16,25 @@ import util.misc as misc
 import util.lr_sched as lr_sched
 
 
+def autocast(device, enabled):
+    """Mixed precision context: fp16 on GPU (T4s have no fast bf16), bf16 on CPU."""
+    device_type = torch.device(device).type
+    dtype = torch.float16 if device_type == 'cuda' else torch.bfloat16
+    return torch.autocast(device_type=device_type, dtype=dtype, enabled=enabled)
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    log_writer=None, args=None):
+                    log_writer=None, args=None, start_iter=0, step_callback=None):
+    """Train for one epoch, or for the rest of one.
+
+    start_iter: data-loader iteration the epoch starts at (non-zero when resuming from a
+        mid-epoch checkpoint). The data loader must already skip those iterations; it is only
+        used here to keep the learning-rate schedule and logging on the full epoch's scale.
+    step_callback: called after every optimizer step with the number of iterations done in
+        this epoch. If it returns True, the epoch stops there.
+    """
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -27,6 +42,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     print_freq = 20
 
     accum_iter = args.accum_iter
+    assert start_iter % accum_iter == 0, 'start_iter must fall on an optimizer-step boundary'
+    iters_per_epoch = start_iter + len(data_loader)
 
     optimizer.zero_grad()
 
@@ -35,25 +52,26 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (points, labels, surface, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for local_step, (points, labels, surface, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        data_iter_step = start_iter + local_step
 
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
-            lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+            lr_sched.adjust_learning_rate(optimizer, data_iter_step / iters_per_epoch + epoch, args)
 
         points = points.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         surface = surface.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with autocast(device, enabled=getattr(args, 'amp', False)):
             outputs = model(surface, points)
             if 'kl' in outputs:
-                loss_kl = outputs['kl']
+                loss_kl = outputs['kl'].float()
                 loss_kl = torch.sum(loss_kl) / loss_kl.shape[0]
             else:
                 loss_kl = None
 
-            outputs = outputs['logits']
+            outputs = outputs['logits'].float()
 
 
             loss_vol = criterion(outputs[:, :1024], labels[:, :1024])
@@ -90,7 +108,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
 
@@ -115,9 +134,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             """ We use epoch_1000x as the x-axis in tensorboard.
             This calibrates different curves when batch size changes.
             """
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+            epoch_1000x = int((data_iter_step / iters_per_epoch + epoch) * 1000)
             log_writer.add_scalar('loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', max_lr, epoch_1000x)
+
+        if step_callback is not None and (data_iter_step + 1) % accum_iter == 0:
+            if step_callback(data_iter_step + 1):
+                break
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -126,7 +149,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device):
+def evaluate(data_loader, model, device, amp=False):
     criterion = torch.nn.BCEWithLogitsLoss()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -142,16 +165,16 @@ def evaluate(data_loader, model, device):
         surface = surface.to(device, non_blocking=True)
 
         # compute output
-        with torch.cuda.amp.autocast(enabled=False):
+        with autocast(device, enabled=amp):
 
             outputs = model(surface, points)
             if 'kl' in outputs:
-                loss_kl = outputs['kl']
+                loss_kl = outputs['kl'].float()
                 loss_kl = torch.sum(loss_kl) / loss_kl.shape[0]
             else:
                 loss_kl = None
 
-            outputs = outputs['logits']
+            outputs = outputs['logits'].float()
 
             loss = criterion(outputs, labels)
 
