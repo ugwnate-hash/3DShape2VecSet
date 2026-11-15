@@ -6,7 +6,7 @@ There are two configs, both with C₀ = 2 latent channels:
 
 | Config | What it is | Expected time on 2× T4 |
 |---|---|---|
-| `configs/kl_d512_m256_l2_d8_2cat.yaml` (default) | Reduced run: 256 latents, an 8-block decoder, the airplane and chair categories, fp16 mixed precision, 50 epochs | roughly 10–20 GPU-hours, so 1–2 sessions. The notebook prints a measured estimate. |
+| `configs/kl_d512_m256_l2_d8_2cat.yaml` (default) | Reduced run: 256 latents, an 8-block decoder, the airplane and chair categories, fp16 mixed precision, 40 epochs | about 10 GPU-hours, so one 11-hour session if data loading keeps up. The notebook prints a measured estimate. |
 | `configs/kl_d512_m512_l2.yaml` | The README's full setup with C₀ = 2 | about 2,000+ GPU-hours. Not practical on Kaggle. |
 
 Kaggle gives about 30 GPU-hours a week, and one session lasts at most 12 hours. Training saves checkpoints during each epoch, stops cleanly before the 12-hour limit, and continues in the next session.

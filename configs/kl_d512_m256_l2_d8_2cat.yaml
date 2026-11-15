@@ -11,7 +11,8 @@
 #     latents is unchanged; in the KL model all of these blocks are in the decoder.
 #   - 2 categories instead of 55: airplane and chair.
 #   - Mixed precision (fp16). The point embedding's Fourier features stay in fp32.
-#   - 50 epochs instead of 200. Each shape is still seen 800 times (16 per epoch).
+#   - 40 epochs instead of 200, sized to fit one 11-hour Kaggle session (about 15 min per
+#     epoch measured on 2x T4). Each shape is still seen 640 times (16 per epoch).
 # C_0 = 2, the KL weight, the 2048-point input, the 2048 query points per shape and
 # the effective batch size of 512 are the same as the README.
 
@@ -22,7 +23,7 @@ model: kl_d512_m256_l2_d8   # M = 256, C_0 = 2, width 512, decoder depth 8
 args:
   categories: "02691156,03001627"   # airplane, chair
   amp: true                # fp16 mixed precision with loss scaling
-  epochs: 50               # README: 200. One epoch is 16 passes over the training shapes.
+  epochs: 40               # README: 200. One epoch is 16 passes over the training shapes.
   warmup_epochs: 2         # README: 5 of 200. Same idea, shorter run.
   point_cloud_size: 2048   # README
   blr: 1.0e-4              # main_ae.py default. Learning rate = blr * effective batch / 256 = 2e-4.

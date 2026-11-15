@@ -70,14 +70,21 @@ def check(name):
 # ----------------------------------------------------------------------------
 
 def make_shape(kind, rng, n=20000):
+    # Training rescales every shape so its surface fills the [-1, 1] box (AxisScaling in
+    # util/datasets.py), but validation and test data are used as stored. So the shapes are
+    # generated already filling the box (largest coordinate 0.95), as real data would be.
     c = rng.uniform(-0.2, 0.2, 3)
     if kind == 'sphere':
         r = rng.uniform(0.35, 0.6)
+        s = 0.95 / (np.abs(c) + r).max()
+        c, r = c * s, r * s
         inside = lambda x: np.linalg.norm(x - c, axis=1) < r
         d = rng.normal(size=(n, 3))
         surf = c + r * d / np.linalg.norm(d, axis=1, keepdims=True)
     else:
         h = rng.uniform(0.2, 0.6, 3)
+        s = 0.95 / (np.abs(c) + h).max()
+        c, h = c * s, h * s
         inside = lambda x: np.all(np.abs(x - c) < h, axis=1)
         areas = np.array([h[1] * h[2], h[0] * h[2], h[0] * h[1]] * 2)
         face = rng.choice(6, n, p=areas / areas.sum())
@@ -413,7 +420,8 @@ def check_eval(d, device, model_name, data_root, ckpt, min_iou):
                          '--categories', '%s,%s' % (SPHERES, BOXES)], timeout=1800)
     d['exit'] = code
     assert code == 0, 'eval.py exited with %d: %s' % (code, log[-1500:])
-    rows = re.findall(r'^(%s|%s) ([-\d.eE]+) ([-\d.eE]+) ([-\d.eE]+)$' % (SPHERES, BOXES), log, re.M)
+    rows = re.findall(r'^(%s|%s) ([-\d.eE]+|nan) ([-\d.eE]+|nan) ([-\d.eE]+|nan)$' % (SPHERES, BOXES), log, re.M)
+    d['empty_mesh_warnings'] = re.findall(r'^WARNING: .*empty mesh.*$', log, re.M)
     results = {}
     for cat, iou, cd, fs in rows:   # the final summary lines come last
         results[cat] = {'iou': float(iou), 'chamfer': float(cd), 'fscore': float(fs)}
@@ -479,6 +487,12 @@ def main():
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     n_gpus = torch.cuda.device_count()
     work = args.workdir or tempfile.mkdtemp(prefix='smoke_')
+    os.makedirs(work, exist_ok=True)
+    # Leftovers from an earlier run in the same folder (checkpoints, logs) would break the
+    # checks, so remove the subfolders this script creates. Nothing else in the folder is touched.
+    import shutil
+    for sub in ('synthetic', 'learn', 'ddp'):
+        shutil.rmtree(os.path.join(work, sub), ignore_errors=True)
     print('model %s | amp %s | device %s | %d GPU(s) | workdir %s' % (model_name, amp, device, n_gpus, work), flush=True)
 
     data_root = make_dataset(os.path.join(work, 'synthetic'))

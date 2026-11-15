@@ -15,6 +15,7 @@ import yaml
 import math
 
 import argparse
+import os
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', default='kl_d512_m512_l8', type=str,
@@ -84,11 +85,12 @@ def main():
             data_loader_test = torch.utils.data.DataLoader(
                 dataset_test, sampler=sampler_test,
                 batch_size=1,
-                num_workers=12,
+                num_workers=min(12, os.cpu_count() or 1),
                 drop_last=False,
             )
 
 
+            n_empty = 0
             for batch in metric_logger.log_every(data_loader_test, 10, header):
                 points, labels, surface, _ = batch
 
@@ -124,6 +126,12 @@ def main():
                 volume = output.view(density+1, density+1, density+1).permute(1, 0, 2).cpu().numpy()
 
                 verts, faces = mcubes.marching_cubes(volume, 0)
+                if len(faces) == 0:
+                    # No surface at level 0: the prediction is all inside or all outside.
+                    # Chamfer distance is undefined for this shape and the F-score is 0.
+                    n_empty += 1
+                    metric_logger.update(cd=float('nan'), fscore=0.0)
+                    continue
                 verts *= gap
                 verts -= 1.
                 m = trimesh.Trimesh(verts, faces)
@@ -162,6 +170,9 @@ def main():
                         fscore = 0
                 metric_logger.update(fscore=fscore)
 
+            if n_empty:
+                print('WARNING: %s: %d of %d shapes gave an empty mesh (Chamfer is nan for this category)'
+                      % (category, n_empty, len(dataset_test)))
             print(category, metric_logger.iou.global_avg, metric_logger.cd.global_avg, metric_logger.fscore.global_avg)
 
         print(args)
