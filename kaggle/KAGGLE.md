@@ -15,16 +15,17 @@ Kaggle gives about 30 GPU-hours a week, and one session lasts at most 12 hours. 
 
 1. **Kaggle account:** verify your phone number in your Kaggle account settings. Kaggle requires it for GPUs and for internet access in notebooks.
 2. **Push the code.** The notebook clones `https://github.com/ugwnate-hash/3DShape2VecSet.git`, branch `fix/review-issues`. Any change you want on Kaggle, configs included, must be committed and pushed to that branch first. If you use another repository or branch, change `REPO_URL` and `BRANCH` in the notebook's first code cell.
-3. **Upload the data as a private Kaggle Dataset.**
-   - Download `occupancies.zip` and `surfaces.zip` from the link in the main [README](../README.md).
-   - To save upload time, unzip them and keep only the categories you train on. For the default config those are `ShapeNetV2_point/02691156`, `ShapeNetV2_point/03001627`, `ShapeNetV2_watertight/02691156` and `ShapeNetV2_watertight/03001627`.
-   - On Kaggle, create a new dataset (**Create → New Dataset**), upload the folders or zips, and keep it **private**. ShapeNet's terms of use don't allow redistribution.
-   - The folder layout inside the dataset doesn't matter. The notebook searches for the folders named `ShapeNetV2_point` and `ShapeNetV2_watertight`.
+3. **Prepare the data on Kaggle.** Don't download the zips yourself: `occupancies.zip` is 589 GB and `surfaces.zip` is 56 GB. Instead:
+   - Import [prepare_data_kaggle.ipynb](prepare_data_kaggle.ipynb) as a new notebook. Set the accelerator to **None** (it runs on CPU and uses no GPU quota) and Internet to **on**.
+   - Run it with **Save Version → Save & Run All (Commit)**. It streams only the airplane and chair files from the zips on Google Drive (about 133 GB) and keeps a random 50k volume, 50k near-surface and 30k surface points per shape. It writes about 16 GB to its output, split files included. This takes roughly 1–3 hours, depending on Google Drive's speed.
+   - Its last cell checks that every shape in the split files is complete. The output stays private to your account. Keep it that way: ShapeNet's terms of use don't allow redistribution.
+   - To train other categories, change `CATEGORIES` in that notebook and `categories` in the training config. The output must stay under Kaggle's 20 GB limit, at about 1.5 MB per shape.
+   - If Google Drive refuses the download ("quota exceeded"), wait a day and run it again.
 4. **Create the notebook:** **Create → New Notebook**, then **File → Import Notebook**, and upload `kaggle/train_ae_kaggle.ipynb`.
 5. **Notebook settings**, in the right-hand panel:
    - **Accelerator:** GPU T4 x2
    - **Internet:** on
-   - **Input:** click **Add Input** and add your dataset from step 3.
+   - **Input:** click **Add Input** and add the **output of the data notebook** from step 3 (under Notebooks / Your Work).
 
 ## 2. Run the smoke test first (about 20–30 minutes, including setup)
 

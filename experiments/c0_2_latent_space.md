@@ -35,6 +35,7 @@ The README setup with C₀ = 2 would need about 2,000+ GPU-hours on Kaggle's 2×
 | Latents per shape M | 512 | **256** | about half the cost; 256 points per plot is still plenty |
 | Decoder self-attention blocks | 24 | **8** | about 0.4× the cost; all of these blocks are in the decoder, so the encoder that produces the latents is unchanged |
 | Categories | 55 | **airplane, chair** | fewer shapes per epoch; two very different shape types should be easy to tell apart in plots |
+| Points stored per shape (volume / near-surface / surface) | 500k / 500k / 100k | **50k / 50k / 30k**, a fixed random subset made by [`kaggle/prepare_subset.py`](../kaggle/prepare_subset.py) | The full data is 645 GB; this subset is about 16 GB and fits on Kaggle. Training draws 1024 + 1024 query points and 2048 surface points per sample, so each kept point is reused about 13 times over 40 epochs. Validation IoU is computed on the 50k kept volume points instead of 500k. |
 | Precision | fp32 | **fp16 mixed precision** | faster on T4 tensor cores. The point embedding's Fourier features stay in fp32, since fp16 would distort them. |
 | Epochs | 200 | **40** (2 warm-up) | sized to fit one 11-hour Kaggle session; each shape is still seen 640 times (16 per epoch) |
 | Effective batch, learning rate | 512, 2e-4 | same | |
