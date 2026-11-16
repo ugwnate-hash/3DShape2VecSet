@@ -14,14 +14,20 @@ surface points per sample. This script:
 
 For airplane + chair it downloads about 133 GB and writes about 16 GB. It's meant for a Kaggle
 CPU notebook with Internet on (see kaggle/KAGGLE.md), but runs anywhere with Python and NumPy.
-It can be resumed: shapes already written are skipped.
 
-    python kaggle/prepare_subset.py --out /kaggle/working/shapenet_subset --categories 02691156,03001627
+Google Drive limits how much a public file can be downloaded per day ("Quota exceeded"),
+counting every user. When that happens the script moves on to the next block, keeps
+everything it has written, and exits with code 3 ("incomplete"). Run it again later with
+--previous pointing at the earlier output: finished files are copied over, not downloaded again.
+
+    python kaggle/prepare_subset.py --out /kaggle/working/shapenet_subset --categories 02691156,03001627 \
+        [--previous /kaggle/input/<earlier-output>/shapenet_subset]
 """
 import argparse
 import concurrent.futures
 import io
 import os
+import shutil
 import struct
 import sys
 import time
@@ -42,21 +48,35 @@ def drive_url(file_id):
     return 'https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t' % file_id
 
 
+class DriveRefused(RuntimeError):
+    """Google Drive answered with a page instead of the file (usually its daily download quota)."""
+
+
+def _refusal(status, body):
+    title = body.split('<title>')[1].split('</title>')[0] if '<title>' in body else body[:200]
+    return DriveRefused('Google Drive refused the download (HTTP %d: %s). Its daily download quota for this '
+                        'file is probably used up; try again in about 24 hours.' % (status, title.strip()))
+
+
 def open_range(url, start, end=None, retries=8):
-    """GET bytes [start, end] (inclusive), retrying with backoff."""
+    """GET bytes [start, end] (inclusive), retrying network errors with backoff."""
     rng = 'bytes=%d-%s' % (start, '' if end is None else end)
     for attempt in range(retries):
         try:
             r = urllib.request.urlopen(urllib.request.Request(url, headers={'Range': rng}), timeout=120)
-            if r.status != 206:
-                body = r.read(2000).decode('utf-8', 'replace')
-                raise RuntimeError('expected a partial response (206), got %d. Google Drive may have '
-                                   'blocked the download (quota exceeded?): %s' % (r.status, body[:300]))
-            return r
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429):   # quota or rate limit: retrying now won't help
+                raise _refusal(e.code, e.read(5000).decode('utf-8', 'replace'))
+            err = e
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            wait = min(300, 5 * 2 ** attempt)
-            print('  request failed (%s), retrying in %d s' % (e, wait), flush=True)
-            time.sleep(wait)
+            err = e
+        else:
+            if r.status != 206:
+                raise _refusal(r.status, r.read(5000).decode('utf-8', 'replace'))
+            return r
+        wait = min(300, 5 * 2 ** attempt)
+        print('  request failed (%s), retrying in %d s' % (err, wait), flush=True)
+        time.sleep(wait)
     raise RuntimeError('giving up after %d failed requests' % retries)
 
 
@@ -176,9 +196,15 @@ def category_of(zip_name, filename):
 
 
 def run_zip(zip_name, categories, args):
+    """Process every category of one zip. Returns the categories left incomplete."""
     url = drive_url(ZIPS[zip_name])
     print('== %s: reading the index' % zip_name, flush=True)
-    infos = zipfile.ZipFile(RemoteFile(url)).infolist()
+    try:
+        infos = zipfile.ZipFile(RemoteFile(url)).infolist()
+    except DriveRefused as e:
+        print('!! %s: %s' % (zip_name, e), flush=True)
+        return list(categories)
+    incomplete = []
     for cat in categories:
         members = sorted((i for i in infos if category_of(zip_name, i.filename) == cat
                           and output_path(args.out, zip_name, i.filename)), key=lambda i: i.header_offset)
@@ -192,38 +218,54 @@ def run_zip(zip_name, categories, args):
               % (zip_name, cat, len(members), len(todo), total / 1e9), flush=True)
         if not todo:
             continue
-        last = todo[-1]
-        stream = Stream(url, todo[0].header_offset, last.header_offset + 30 + 65535 * 2 + last.compress_size)
-        t0, done = time.time(), 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-            pending = []
-            for m in todo:
-                data = member_data(stream, m)
-                path = output_path(args.out, zip_name, m.filename)
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                if m.filename.endswith('.npz'):
-                    if zip_name == 'occupancies':
-                        pending.append(pool.submit(process_occupancy, data, m.filename, path, args.vol_points, args.near_points))
-                    else:
-                        pending.append(pool.submit(process_surface, data, m.filename, path, args.surface_points))
-                else:                      # .npy scale files and .lst split files: copy as-is
-                    with open(path + '.tmp', 'wb') as f:
-                        f.write(data)
-                    os.replace(path + '.tmp', path)
-                # bounded queue: keep at most a few shapes in memory
-                while len(pending) > 2 * args.workers:
-                    pending.pop(0).result()
-                done += 1
-                if done % 200 == 0 or done == len(todo):
-                    el = time.time() - t0
-                    rate = stream.bytes / max(el, 1e-9)
-                    print('   %d/%d files | %.1f GB | %.0f MB/s | about %.0f min left'
-                          % (done, len(todo), stream.bytes / 1e9, rate / 1e6,
-                             (total - stream.bytes) / max(rate, 1) / 60), flush=True)
-            for p in pending:
-                p.result()
+        try:
+            fetch(url, zip_name, todo, total, args)
+        except DriveRefused as e:
+            print('!! %s / %s stopped: %s Files written so far are kept.' % (zip_name, cat, e), flush=True)
+            incomplete.append(cat)
+    return incomplete
+
+
+def fetch(url, zip_name, todo, total, args):
+    """Stream the zip members in `todo` (sorted by offset) and write their outputs."""
+    last = todo[-1]
+    stream = Stream(url, todo[0].header_offset, last.header_offset + 30 + 65535 * 2 + last.compress_size)
+    try:
+        _fetch(stream, zip_name, todo, total, args)
+    finally:
         if stream.resp is not None:
             stream.resp.close()
+
+
+def _fetch(stream, zip_name, todo, total, args):
+    t0, done = time.time(), 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+        pending = []
+        for m in todo:
+            data = member_data(stream, m)
+            path = output_path(args.out, zip_name, m.filename)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if m.filename.endswith('.npz'):
+                if zip_name == 'occupancies':
+                    pending.append(pool.submit(process_occupancy, data, m.filename, path, args.vol_points, args.near_points))
+                else:
+                    pending.append(pool.submit(process_surface, data, m.filename, path, args.surface_points))
+            else:                      # .npy scale files and .lst split files: copy as-is
+                with open(path + '.tmp', 'wb') as f:
+                    f.write(data)
+                os.replace(path + '.tmp', path)
+            # bounded queue: keep at most a few shapes in memory
+            while len(pending) > 2 * args.workers:
+                pending.pop(0).result()
+            done += 1
+            if done % 200 == 0 or done == len(todo):
+                el = time.time() - t0
+                rate = stream.bytes / max(el, 1e-9)
+                print('   %d/%d files | %.1f GB | %.0f MB/s | about %.0f min left'
+                      % (done, len(todo), stream.bytes / 1e9, rate / 1e6,
+                         (total - stream.bytes) / max(rate, 1) / 60), flush=True)
+        for p in pending:
+            p.result()
 
 
 def main():
@@ -235,13 +277,48 @@ def main():
     p.add_argument('--surface_points', type=int, default=30000, help='surface points kept per shape (of 100k)')
     p.add_argument('--workers', type=int, default=3, help='threads that subsample and write while downloading')
     p.add_argument('--limit', type=int, default=0, help='only the first N files per category and zip (for testing)')
+    p.add_argument('--previous', action='append', default=[],
+                   help='output folder of an earlier run (can be given several times): its finished files '
+                        'are copied into --out instead of being downloaded again')
     args = p.parse_args()
     categories = [c.strip() for c in args.categories.split(',') if c.strip()]
     t = time.time()
-    for zip_name in ('occupancies', 'surfaces'):
-        run_zip(zip_name, categories, args)
+    for prev in args.previous:
+        copy_previous(prev, args.out, categories)
+    incomplete = []
+    # surfaces.zip first: it is smaller, and it is a separate file with its own download quota
+    for zip_name in ('surfaces', 'occupancies'):
+        incomplete += [(zip_name, c) for c in run_zip(zip_name, categories, args)]
     size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(args.out) for f in fs)
-    print('done in %.0f min: %.1f GB in %s' % ((time.time() - t) / 60, size / 1e9, args.out))
+    print('finished in %.0f min: %.1f GB in %s' % ((time.time() - t) / 60, size / 1e9, args.out))
+    if incomplete:
+        print('INCOMPLETE: %s. Google Drive refused part of the download. Run again in about 24 hours '
+              'with --previous %s (on Kaggle: add this run\'s output as an input).'
+              % (', '.join('%s/%s' % z for z in incomplete), args.out))
+        sys.exit(3)
+    print('COMPLETE')
+
+
+def copy_previous(prev, out, categories):
+    """Copy finished files of the chosen categories from an earlier run's output."""
+    if not os.path.isdir(prev):
+        print('WARNING: --previous %s does not exist; nothing copied' % prev, flush=True)
+        return
+    n = 0
+    for sub in ('ShapeNetV2_point', 'ShapeNetV2_watertight'):
+        for cat in categories:
+            src_root = os.path.join(prev, sub, cat)
+            for root, _, files in os.walk(src_root):
+                for f in files:
+                    if '.tmp' in f:         # half-written file from an interrupted run
+                        continue
+                    src = os.path.join(root, f)
+                    dst = os.path.join(out, os.path.relpath(src, prev))
+                    if not os.path.exists(dst):
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.copyfile(src, dst)
+                        n += 1
+    print('copied %d finished files from %s' % (n, prev), flush=True)
 
 
 if __name__ == '__main__':
