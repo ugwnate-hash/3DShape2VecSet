@@ -17,8 +17,10 @@ CPU notebook with Internet on (see kaggle/KAGGLE.md), but runs anywhere with Pyt
 
 Google Drive limits how much a public file can be downloaded per day ("Quota exceeded"),
 counting every user. When that happens the script moves on to the next block, keeps
-everything it has written, and exits with code 3 ("incomplete"). Run it again later with
---previous pointing at the earlier output: finished files are copied over, not downloaded again.
+everything it has written, and exits with code 3 ("incomplete"). With --retry_for_hours it
+keeps trying every --retry_every_min minutes instead. Run it again later with --previous
+pointing at the earlier output: finished files are not downloaded again. They are copied over
+at the end, so the downloads start right away while Drive allows them.
 
     python kaggle/prepare_subset.py --out /kaggle/working/shapenet_subset --categories 02691156,03001627 \
         [--previous /kaggle/input/<earlier-output>/shapenet_subset]
@@ -212,7 +214,7 @@ def run_zip(zip_name, categories, args):
             raise RuntimeError('category %s not found in %s' % (cat, zip_name))
         if args.limit:
             members = members[:args.limit]
-        todo = [m for m in members if not os.path.exists(output_path(args.out, zip_name, m.filename))]
+        todo = [m for m in members if not is_done(output_path(args.out, zip_name, m.filename), args)]
         total = sum(m.compress_size for m in todo)
         print('-- %s / %s: %d files, %d left to do (%.1f GB to download)'
               % (zip_name, cat, len(members), len(todo), total / 1e9), flush=True)
@@ -279,16 +281,36 @@ def main():
     p.add_argument('--limit', type=int, default=0, help='only the first N files per category and zip (for testing)')
     p.add_argument('--previous', action='append', default=[],
                    help='output folder of an earlier run (can be given several times): its finished files '
-                        'are copied into --out instead of being downloaded again')
+                        'are not downloaded again, and are copied into --out at the end')
+    p.add_argument('--retry_for_hours', type=float, default=0,
+                   help='if Google Drive refuses, keep retrying for up to this many hours (0: try once)')
+    p.add_argument('--retry_every_min', type=float, default=30, help='minutes between retries')
     args = p.parse_args()
     categories = [c.strip() for c in args.categories.split(',') if c.strip()]
+    for prev in args.previous:
+        if not os.path.isdir(prev):
+            print('WARNING: --previous %s does not exist; ignored' % prev, flush=True)
+    args.previous = [prev for prev in args.previous if os.path.isdir(prev)]
     t = time.time()
+    deadline = t + args.retry_for_hours * 3600
+    # surfaces.zip first: it is smaller, and it is a separate file with its own download quota
+    remaining = {'surfaces': list(categories), 'occupancies': list(categories)}
+    attempt = 0
+    while True:
+        attempt += 1
+        for zip_name in list(remaining):
+            remaining[zip_name] = run_zip(zip_name, remaining[zip_name], args)
+            if not remaining[zip_name]:
+                del remaining[zip_name]
+        if not remaining or time.time() + args.retry_every_min * 60 > deadline:
+            break
+        print('[attempt %d] still refused: %s. Retrying in %.0f min (until %.1f h after start).'
+              % (attempt, ', '.join('%s/%s' % (z, c) for z, cs in remaining.items() for c in cs),
+                 args.retry_every_min, args.retry_for_hours), flush=True)
+        time.sleep(args.retry_every_min * 60)
+    incomplete = [(z, c) for z, cs in remaining.items() for c in cs]
     for prev in args.previous:
         copy_previous(prev, args.out, categories)
-    incomplete = []
-    # surfaces.zip first: it is smaller, and it is a separate file with its own download quota
-    for zip_name in ('surfaces', 'occupancies'):
-        incomplete += [(zip_name, c) for c in run_zip(zip_name, categories, args)]
     size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(args.out) for f in fs)
     print('finished in %.0f min: %.1f GB in %s' % ((time.time() - t) / 60, size / 1e9, args.out))
     if incomplete:
@@ -297,6 +319,14 @@ def main():
               % (', '.join('%s/%s' % z for z in incomplete), args.out))
         sys.exit(3)
     print('COMPLETE')
+
+
+def is_done(path, args):
+    """True if this output file exists in --out or in one of the --previous folders."""
+    if os.path.exists(path):
+        return True
+    rel = os.path.relpath(path, args.out)
+    return any(os.path.exists(os.path.join(prev, rel)) for prev in args.previous)
 
 
 def copy_previous(prev, out, categories):
