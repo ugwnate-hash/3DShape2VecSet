@@ -53,9 +53,38 @@ These are hypotheses, not results:
 - The 2-channel bottleneck dominates the error, so cutting the decoder from 24 to 8 blocks should cost relatively little. This is untested.
 - Because the KL weight is small (1e-3), the latents will probably not look like N(0, 1). How far they spread is one of the things to look at.
 
+## Latent pairs: two chairs, two airplanes
+
+Script: [`experiments/plot_latent_pairs.py`](plot_latent_pairs.py). It encodes two chairs and two airplanes from the `test` split (not seen in training) and draws their 4 × 256 latents in one scatter. Each class has one hue (chairs blue, airplanes orange), and each shape has one tone of it. The figure also shows the input point clouds and a 4 × 4 matrix of distances between the latent sets.
+
+**Hypothesis:** the two chairs' latents are close to each other, the two airplanes' latents are close to each other, and chairs are far from airplanes.
+
+**Distance between two shapes.** A shape's latents are an unordered set: their order comes from farthest point sampling with a random start. So the distance is the mean Euclidean distance under the optimal one-to-one matching of the two sets of 256 points (earth mover's distance), not a comparison of latent *i* with latent *i*.
+
+**Two shapes per class can't prove the hypothesis on their own.** The script therefore also encodes `--n_stats` shapes per class (50 by default) and reports:
+- the mean within-chair, within-airplane and between-class distances,
+- the share of shapes whose nearest neighbour in latent space has the same class,
+- the AUC that a within-class pair is closer than a between-class pair,
+- the percentile of each plotted pair in those distributions, which shows whether the four plotted shapes are typical.
+
+Report these numbers together with the figure.
+
+**Baseline: an untrained encoder.** The encoder is a function of the input geometry, so even random weights can map chairs and airplanes to different places. On synthetic boxes and crosses, a random-weight encoder already separated the two classes, with an AUC of 0.95. Run the same script with `--pth random`. The trained model's separation means something only to the extent that it beats this baseline.
+
+Also check each shape's reconstruction IoU, which the script prints: if the autoencoder doesn't reconstruct the shapes, its latents say little.
+
+Run it after training (GPU or CPU; it takes a few minutes, mostly the `--n_stats` encodings):
+
+```
+python experiments/plot_latent_pairs.py --pth <checkpoint.pth> --data_path <data> --out output/analysis/latent_pairs
+python experiments/plot_latent_pairs.py --pth random          --data_path <data> --out output/analysis/latent_pairs_random
+```
+
+To choose the shapes yourself, pass `--chairs <id>,<id> --airplanes <id>,<id>`; by default they are drawn at random from the split with `--seed`. Outputs: `latent_pairs.png`/`.pdf`, `latents.csv` (every plotted latent, with its mean, std and FPS surface point), `latent_pairs.npz` and `summary.json`. On Kaggle, add the data notebook's output and the training output as inputs, clone the repository, and set `--data_path` to the folder that holds `ShapeNetV2_point` and `ShapeNetV2_watertight`. The script uses a pure-PyTorch fps if `torch_cluster` isn't installed.
+
 ## Planned analysis
 
-To do after training (no plotting script exists yet):
+To do after training (item 2 is partly covered by `plot_latent_pairs.py` above):
 
 1. **One shape:** scatter its 256 latents, colored by the x, y or z position of the surface point each latent comes from (the encoder's farthest-point samples). This tests whether the latent layout follows the geometry.
 2. **Many shapes:** overlay latents of many airplanes and chairs, colored by category, together with the N(0, 1) prior.
@@ -74,4 +103,5 @@ Use the posterior **mean** for plots. `encode()` returns a random sample, and it
   - Failed, now fixed: two failures caused by the test, not the training code (stale files in the work folder, and synthetic shapes that weren't scaled like the training inputs). The two-GPU resume and `eval.py` still need a rerun.
   - Projected from the measured speed, assuming about 10k training shapes: about 15 min per epoch, so roughly 10 h for the 40 configured epochs if the GPUs set the pace. Data loading hasn't been measured on real data yet.
 - Training: not started.
+- `experiments/plot_latent_pairs.py`: tested end to end on CPU with synthetic shapes and random weights only; not yet run on a trained model.
 - Results: none yet.
