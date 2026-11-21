@@ -102,6 +102,8 @@ Use the posterior **mean** for plots. `encode()` returns a random sample, and it
     - Without the fp32 guard, the Fourier features would be off by up to 0.31.
   - Failed, now fixed: two failures caused by the test, not the training code (stale files in the work folder, and synthetic shapes that weren't scaled like the training inputs). The two-GPU resume and `eval.py` still need a rerun.
   - Projected from the measured speed, assuming about 10k training shapes: about 15 min per epoch, so roughly 10 h for the 40 configured epochs if the GPUs set the pace. Data loading hasn't been measured on real data yet.
+- GPU smoke test, second run with real data: all 9 checks passed. Two-GPU stop and resume work, `eval.py` runs, and the synthetic learning check reached validation IoU 0.73. The real data has 10,013 training shapes (3,742 airplanes, 6,271 chairs) and 270 validation shapes. At 96 samples/s per GPU, one epoch takes about 15.5 min, so 40 epochs take about 10.3 h if the GPUs set the pace.
+- Data: complete (airplane + chair, about 16 GB), built on Kaggle by `kaggle/prepare_data_kaggle.ipynb` over several sessions. Google Drive's daily download quota (shared by all users of the files) refused `occupancies.zip` several times; the retry loop got it through.
 - Training: not started.
 - `experiments/plot_latent_pairs.py`: tested end to end on CPU with synthetic shapes and random weights only; not yet run on a trained model.
 - Results: none yet.
